@@ -1,0 +1,74 @@
+diff --git a/Platform/RaspberryPi/AcpiTables/AcpiTables.h b/Platform/RaspberryPi/AcpiTables/AcpiTables.h
+index 37e2a6b..d669aeb 100644
+--- a/Platform/RaspberryPi/AcpiTables/AcpiTables.h
++++ b/Platform/RaspberryPi/AcpiTables/AcpiTables.h
+@@ -163,6 +163,7 @@ typedef struct
+ #define BCM2836_PL011_UART_INTERRUPT            0x99
+ #define GENET_INTERRUPT0                        0xBD
+ #define GENET_INTERRUPT1                        0xBE
++#define BCM2836_XHCI_INTERRUPT                  0xD0
+ #endif
+ 
+ #endif // __ACPITABLES_H__
+diff --git a/Platform/RaspberryPi/AcpiTables/Dsdt.asl b/Platform/RaspberryPi/AcpiTables/Dsdt.asl
+index b594d50..dcafeda 100644
+--- a/Platform/RaspberryPi/AcpiTables/Dsdt.asl
++++ b/Platform/RaspberryPi/AcpiTables/Dsdt.asl
+@@ -251,6 +251,43 @@ DefinitionBlock ("Dsdt.aml", "DSDT", 2, "RPIFDN", "RPI", 2)
+       })
+     }
+ 
++    Device (XHC1)
++    {
++      Name (_HID, "PNP0D10")
++      Name (_UID, 0x1)
++      Name (_CCA, 0x0)
++      Method (_STA)
++      {
++        Return (0xf)
++      }
++      Name (RBUF, ResourceTemplate ()
++      {
++        MEMORY32FIXED (ReadWrite, 0, BCM2836_XHCI_LENGTH, XMEM)
++        Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { BCM2836_XHCI_INTERRUPT }
++      })
++      Method (_CRS, 0x0, Serialized)
++      {
++        MEMORY32SETBASE (RBUF, XMEM, XBAS, BCM2836_XHCI_OFFSET)
++        Return (^RBUF)
++      }
++      Name (DSMU, ToUUID ("ce2ee385-00e6-48cb-9f05-2edb927c4899"))
++      Method (_DSM, 4, Serialized)
++      {
++        If (LEqual (Arg0, DSMU)) {
++          Switch (ToInteger (Arg2)) {
++          Case (0) {
++            Return (Buffer () { 0x41 })
++          }
++          Case (6) {
++            Return (Buffer () { 0x01 })
++          }
++          Default { }
++          }
++        }
++        Return (Buffer () { 0x00 })
++      }
++    }
++
+     // Define a simple thermal zone. The idea here is we compute the SOC temp
+     // via a register we can read, and give it to the OS. This enables basic
+     // reports from the "sensors" utility, and the OS can then poll and take
+diff --git a/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836.h b/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836.h
+index a930c64..0998f91 100644
+--- a/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836.h
++++ b/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836.h
+@@ -75,6 +75,9 @@
+ #define BCM2836_USB_OFFSET                                  0x00980000
+ #define BCM2836_USB_BASE_ADDRESS                            (BCM2836_SOC_REGISTERS + BCM2836_USB_OFFSET)
+ #define BCM2836_USB_LENGTH                                  0x00010000
++#define BCM2836_XHCI_OFFSET                                 0x009C0000
++#define BCM2836_XHCI_BASE_ADDRESS                           (BCM2836_SOC_REGISTERS + BCM2836_XHCI_OFFSET)
++#define BCM2836_XHCI_LENGTH                                 0x00010000
+ 
+ /* serial based protocol constants */
+ #define BCM2836_PL011_UART_OFFSET                           0x00201000

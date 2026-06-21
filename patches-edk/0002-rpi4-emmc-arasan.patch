@@ -1,0 +1,291 @@
+diff --git a/Platform/RaspberryPi/Drivers/ArasanMmcHostDxe/ArasanMmcHostDxe.c b/Platform/RaspberryPi/Drivers/ArasanMmcHostDxe/ArasanMmcHostDxe.c
+index 1a4fe25..49b55f7 100644
+--- a/Platform/RaspberryPi/Drivers/ArasanMmcHostDxe/ArasanMmcHostDxe.c
++++ b/Platform/RaspberryPi/Drivers/ArasanMmcHostDxe/ArasanMmcHostDxe.c
+@@ -272,6 +272,10 @@ CalculateClockFrequencyDivisor (
+     Divisor += 1;
+   }
+ 
++  if ((TargetFrequency < BaseFrequency) && (Divisor == 0)) {
++    Divisor = 1;
++  }
++
+   if (Divisor > MAX_DIVISOR_VALUE) {
+     Divisor = MAX_DIVISOR_VALUE;
+   }
+@@ -339,6 +343,7 @@ MMCSendCommand (
+   BOOLEAN IsAppCmd = (LastExecutedCommand == CMD55);
+   BOOLEAN IsDATCmd = FALSE;
+   BOOLEAN IsADTCCmd = FALSE;
++  BOOLEAN IsR1bCmd = FALSE;
+ 
+   DEBUG ((DEBUG_MMCHOST_SD, "ArasanMMCHost: MMCSendCommand(MmcCmd: %08x, Argument: %08x)\n", MmcCmd, Argument));
+ 
+@@ -351,9 +356,18 @@ MMCSendCommand (
+     return EFI_UNSUPPORTED;
+   }
+ 
++  if ((MmcCmd == CMD6) && ((Argument & EMMC_CMD6_ACCESS_MASK) != 0)) {
++    MmcCmd = (MmcCmd & ~(RSP_TYPE_MASK | DP_ENABLE | DDIR_READ)) | RSP_TYPE_48BUSY;
++  }
++
+   if ((MmcCmd & CMD_R1_ADTC) == CMD_R1_ADTC) {
+     IsADTCCmd = TRUE;
+   }
++  if ((MmcCmd & RSP_TYPE_MASK) == RSP_TYPE_48BUSY &&
++    (MmcCmd & TYPE (CMD_TYPE_ABORT)) != TYPE (CMD_TYPE_ABORT)) {
++    IsR1bCmd = TRUE;
++  }
++
+   if (((MmcCmd & CMD_R1B) == CMD_R1B &&
+     /*
+      * Abort commands don't get inhibited by DAT.
+@@ -445,6 +459,37 @@ MMCSendCommand (
+       MmioRead32 (MMCHS_PRES_STATE), MmcStatus));
+     Status = EFI_TIMEOUT;
+     goto Exit;
++  }
++
++  if (IsR1bCmd) {
++    RetryCount = 0;
++    while (RetryCount < MAX_RETRY_COUNT) {
++      MmcStatus = MmioRead32 (MMCHS_INT_STAT);
++      if ((MmcStatus & ERRI) != 0) {
++        DEBUG ((DEBUG_ERROR, "%a(%u): MMC_CMD%u R1b busy ERRI MmcStatus 0x%x\n",
++          __func__, __LINE__, MMC_CMD_NUM (MmcCmd), MmcStatus));
++        SoftReset (SRC | SRD);
++        Status = EFI_DEVICE_ERROR;
++        goto Exit;
++      }
++
++      if (((MmioRead32 (MMCHS_PRES_STATE) & (DATI_MASK | DLA_MASK)) == 0) ||
++          ((MmcStatus & TC) != 0)) {
++        SdMmioWrite32 (MMCHS_INT_STAT, TC);
++        break;
++      }
++
++      RetryCount++;
++      gBS->Stall (STALL_AFTER_RETRY_US);
++    }
++
++    if (RetryCount == MAX_RETRY_COUNT) {
++      DEBUG ((DEBUG_ERROR, "%a(%u): MMC_CMD%u R1b busy TIMEOUT PresState 0x%x MmcStatus 0x%x\n",
++        __func__, __LINE__, MMC_CMD_NUM (MmcCmd),
++        MmioRead32 (MMCHS_PRES_STATE), MmioRead32 (MMCHS_INT_STAT)));
++      Status = EFI_TIMEOUT;
++      goto Exit;
++    }
+   }
+ 
+ Exit:
+@@ -686,9 +731,9 @@ MMCReadBlockData (
+   IN UINT32*                  Buffer
+   )
+ {
+-  UINTN MmcStatus;
+-  UINTN RemLength;
+-  UINTN Count;
++  UINTN  MmcStatus;
++  UINTN  RemLength;
++  UINTN  Count;
+ 
+   DEBUG ((DEBUG_VERBOSE, "%a(%u): LBA: 0x%x, Length: 0x%x, Buffer: 0x%x)\n",
+     __func__, __LINE__, Lba, Length, Buffer));
+@@ -703,6 +748,7 @@ MMCReadBlockData (
+     return EFI_INVALID_PARAMETER;
+   }
+ 
++  mFwProtocol->SetLed (TRUE);
+   RemLength = Length;
+   while (RemLength != 0) {
+     UINTN RetryCount = 0;
+@@ -711,16 +757,11 @@ MMCReadBlockData (
+     while (RetryCount < MAX_RETRY_COUNT) {
+       MmcStatus = MmioRead32 (MMCHS_INT_STAT);
+       if ((MmcStatus & BRR) != 0) {
+-        SdMmioWrite32 (MMCHS_INT_STAT, BRR);
+-        /*
+-         * Data is ready.
+-         */
+-        mFwProtocol->SetLed (TRUE);
++        MmioWrite32 (MMCHS_INT_STAT, BRR);
+         for (Count = 0; Count < BlockLen; Count += 4, Buffer++) {
+           *Buffer = MmioRead32 (MMCHS_DATA);
+         }
+ 
+-        mFwProtocol->SetLed (FALSE);
+         break;
+       }
+ 
+@@ -729,16 +770,18 @@ MMCReadBlockData (
+     }
+ 
+     if (RetryCount == MAX_RETRY_COUNT) {
++      mFwProtocol->SetLed (FALSE);
+       DEBUG ((DEBUG_ERROR, "%a(%u): %lu/%lu MMCHS_INT_STAT: %08x\n",
+         __func__, __LINE__, Length - RemLength, Length, MmcStatus));
+       return EFI_TIMEOUT;
+     }
+ 
+     RemLength -= BlockLen;
+-    gBS->Stall (STALL_AFTER_READ_US);
+   }
+ 
++  mFwProtocol->SetLed (FALSE);
+   SdMmioWrite32 (MMCHS_INT_STAT, BRR);
++
+   return EFI_SUCCESS;
+ }
+ 
+@@ -767,6 +810,7 @@ MMCWriteBlockData (
+     return EFI_INVALID_PARAMETER;
+   }
+ 
++  mFwProtocol->SetLed (TRUE);
+   RemLength = Length;
+   while (RemLength != 0) {
+     UINTN RetryCount = 0;
+@@ -775,16 +819,11 @@ MMCWriteBlockData (
+     while (RetryCount < MAX_RETRY_COUNT) {
+       MmcStatus = MmioRead32 (MMCHS_INT_STAT);
+       if ((MmcStatus & BWR) != 0) {
+-        SdMmioWrite32 (MMCHS_INT_STAT, BWR);
+-        /*
+-         * Can write data.
+-         */
+-        mFwProtocol->SetLed (TRUE);
++        MmioWrite32 (MMCHS_INT_STAT, BWR);
+         for (Count = 0; Count < BlockLen; Count += 4, Buffer++) {
+-          SdMmioWrite32 (MMCHS_DATA, *Buffer);
++          MmioWrite32 (MMCHS_DATA, *Buffer);
+         }
+ 
+-        mFwProtocol->SetLed (FALSE);
+         break;
+       }
+ 
+@@ -793,16 +832,73 @@ MMCWriteBlockData (
+     }
+ 
+     if (RetryCount == MAX_RETRY_COUNT) {
++      mFwProtocol->SetLed (FALSE);
+       DEBUG ((DEBUG_ERROR, "%a(%u): %lu/%lu MMCHS_INT_STAT: %08x\n",
+         __func__, __LINE__, Length - RemLength, Length, MmcStatus));
+       return EFI_TIMEOUT;
+     }
+ 
+     RemLength -= BlockLen;
+-    gBS->Stall (STALL_AFTER_WRITE_US);
+   }
+ 
++  mFwProtocol->SetLed (FALSE);
+   SdMmioWrite32 (MMCHS_INT_STAT, BWR);
++  return EFI_SUCCESS;
++}
++
++EFI_STATUS
++MMCSetIos (
++  IN EFI_MMC_HOST_PROTOCOL    *This,
++  IN UINT32                   BusClockFreq,
++  IN UINT32                   BusWidth,
++  IN UINT32                   TimingMode
++  )
++{
++  EFI_STATUS Status;
++  UINTN      ActualFrequency = 0;
++  UINT32     Divisor = 0;
++
++  if ((TimingMode == EMMCHS52DDR1V8) || (TimingMode == EMMCHS52DDR1V2)) {
++    DEBUG ((DEBUG_INFO, "ArasanMMCHost: MMCSetIos(): DDR mode %u not supported, falling back to SDR\n", TimingMode));
++    return EFI_UNSUPPORTED;
++  }
++
++  if (BusClockFreq != 0) {
++    Status = CalculateClockFrequencyDivisor (BusClockFreq, &Divisor, &ActualFrequency);
++    if (EFI_ERROR (Status)) {
++      DEBUG ((DEBUG_ERROR, "ArasanMMCHost: MMCSetIos(): Fail to set clock to %u Hz: %r\n", BusClockFreq, Status));
++      return Status;
++    }
++
++    SdMmioAnd32 (MMCHS_SYSCTL, ~CEN);
++  }
++
++  if (BusWidth == 8) {
++    SdMmioAndThenOr32 (MMCHS_HCTL, (UINT32) ~DTW_4_BIT, DTW_8_BIT);
++  } else if (BusWidth == 4) {
++    SdMmioAndThenOr32 (MMCHS_HCTL, (UINT32) ~DTW_8_BIT, DTW_4_BIT);
++  } else if (BusWidth == 1) {
++    SdMmioAnd32 (MMCHS_HCTL, (UINT32) ~(DTW_8_BIT | DTW_4_BIT));
++  }
++
++  if (BusClockFreq != 0) {
++    if (TimingMode != EMMCBACKWARD) {
++      SdMmioOr32 (MMCHS_HCTL, HSEN);
++    } else {
++      SdMmioAnd32 (MMCHS_HCTL, (UINT32) ~HSEN);
++    }
++
++    SdMmioOr32 (MMCHS_SYSCTL, ICE);
++    SdMmioAndThenOr32 (MMCHS_SYSCTL, (UINT32) ~CLKD_MASK, Divisor);
++    while ((MmioRead32 (MMCHS_SYSCTL) & ICS_MASK) != ICS);
++    SdMmioOr32 (MMCHS_SYSCTL, CEN);
++  }
++
++  DEBUG ((DEBUG_INFO,
++    "ArasanMMCHost: MMCSetIos() applied: ReqClock %u Hz ActualClock %lu Hz, BusWidth %u-bit, Timing 0x%x, HighSpeed %a\n",
++    BusClockFreq, (UINT64) ActualFrequency, BusWidth, TimingMode,
++    ((BusClockFreq != 0) && (TimingMode != EMMCBACKWARD)) ? "ON" : "OFF"));
++
+   return EFI_SUCCESS;
+ }
+ 
+@@ -825,7 +921,7 @@ EFI_MMC_HOST_PROTOCOL gMMCHost =
+   MMCReceiveResponse,
+   MMCReadBlockData,
+   MMCWriteBlockData,
+-  NULL,
++  MMCSetIos,
+   MMCIsMultiBlock
+ };
+ 
+@@ -841,10 +937,10 @@ MMCInitialize (
+   DEBUG ((DEBUG_MMCHOST_SD, "ArasanMMCHost: MMCInitialize()\n"));
+ 
+   if (PcdGet32 (PcdSdIsArasan)) {
+-    DEBUG ((DEBUG_INFO, "SD is routed to Arasan\n"));
++    DEBUG ((DEBUG_INFO, "ArasanMMCHost: eMMC/SD routed to ARASAN SDHCI (MMCHS1 base 0x%lx), transfer mode = CPU PIO\n", (UINT64) MMCHS1_BASE));
+     mMmcHsBase = MMCHS1_BASE;
+   } else if (RPI_MODEL == 4) {
+-    DEBUG ((DEBUG_INFO, "SD is routed to emmc2\n"));
++    DEBUG ((DEBUG_INFO, "ArasanMMCHost: eMMC/SD routed to EMMC2 controller (MMCHS2 base 0x%lx), transfer mode = CPU PIO\n", (UINT64) MMCHS2_BASE));
+     mMmcHsBase = MMCHS2_BASE;
+   } else {
+     DEBUG ((DEBUG_INFO, "SD is not routed to Arasan\n"));
+diff --git a/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836Sdio.h b/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836Sdio.h
+index 1068a63..8a53e09 100644
+--- a/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836Sdio.h
++++ b/Silicon/Broadcom/Bcm283x/Include/IndustryStandard/Bcm2836Sdio.h
+@@ -59,11 +59,14 @@
+ #define DATI_MASK         BIT1
+ #define DATI_ALLOWED      (0x0UL << 1)
+ #define DATI_NOT_ALLOWED  BIT1
++#define DLA_MASK          BIT2
+ #define WRITE_PROTECT_OFF BIT19
+ 
+ #define MMCHS_HCTL        (mMmcHsBase + 0x28)
+ #define DTW_1_BIT         (0x0UL << 1)
+ #define DTW_4_BIT         BIT1
++#define HSEN              BIT2
++#define DTW_8_BIT         BIT5
+ #define SDBP_MASK         BIT8
+ #define SDBP_OFF          (0x0UL << 8)
+ #define SDBP_ON           BIT8
+@@ -184,6 +187,8 @@
+ #define CMD25             (INDX(25) | CMD_R1_ADTC_WRITE | MSBS_MULTBLK) // Write Multiple Blocks
+ #define CMD55             (INDX(55) | CMD_R1) // App Cmd
+ 
++#define EMMC_CMD6_ACCESS_MASK (0x3UL << 24)
++
+ #define ACMD6             (INDX(6) | CMD_R1) // Set Bus Width
+ #define ACMD22            (INDX(22) | CMD_R1_ADTC_READ) // SEND_NUM_WR_BLOCKS
+ #define ACMD41            (INDX(41) | CMD_R3) // Send Op Cond
